@@ -1,147 +1,104 @@
 from flask import Flask, request, jsonify
 import logging
 import requests
-import os
 
 app = Flask(__name__)
 
-# --- Logging Setup ---
+# Basic logging
 logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(levelname)s: %(message)s')
 logger = logging.getLogger(__name__)
 
-# --- Configuration ---
-# You set this in your OnDemand environment variables or .env file
-WEBHOOK_VERIFY_TOKEN = os.getenv("WEBHOOK_VERIFY_TOKEN", "my_secret_token")
-
-# --- 1. Webhook Verification (Meta Standard) ---
+# ==============================================================================
+# 1. VERIFICATION (The Handshake)
+# ==============================================================================
 @app.route("/webhook", methods=["GET"])
 def verify_webhook():
     """
-    Meta calls this to verify your server exists.
+    User Input in Meta: 
+    Callback URL: https://your-app.com/webhook?my_secret=12345
+    Verify Token: 12345
     """
-    mode = request.args.get('hub.mode')
-    token = request.args.get('hub.verify_token')
+    # 1. Get the secret the USER embedded in the URL
+    user_secret_in_url = request.args.get('my_secret')
+    
+    # 2. Get the token META is sending
+    meta_token = request.args.get('hub.verify_token')
     challenge = request.args.get('hub.challenge')
 
-    if mode and token:
-        if mode == 'subscribe' and token == WEBHOOK_VERIFY_TOKEN:
-            logger.info("Meta Webhook Verified Successfully.")
+    # 3. Compare them.
+    if user_secret_in_url and meta_token and challenge:
+        if user_secret_in_url == meta_token:
             return challenge, 200
-    
-    logger.error("Webhook Verification Failed.")
+            
     return 'Forbidden', 403
 
-# --- 2. Webhook Listener (Read DMs & Comments) ---
+# ==============================================================================
+# 2. FORWARDING (The Blind Pipe)
+# ==============================================================================
 @app.route("/webhook", methods=["POST"])
 def handle_webhook():
     """
-    Receives real-time updates from Instagram.
-    Extracts the data so you can process it.
+    User Input in Meta:
+    Callback URL: https://your-app.com/webhook?target_url=https://other-agent.com/api
     """
-    data = request.json
+    # 1. Read the destination from the URL
+    target_url = request.args.get('target_url')
     
-    # Simple check to ensure it's an Instagram event
-    if data.get('object') != 'instagram':
-        return jsonify({"status": "ignored"}), 200
+    if not target_url:
+        return jsonify({"status": "error", "message": "No target_url provided"}), 200
 
-    for entry in data.get('entry', []):
-        page_id = entry.get('id')
+    # 2. Forward the data blindly.
+    try:
+        requests.post(
+            target_url, 
+            json=request.json, 
+            headers={"Content-Type": "application/json"},
+            timeout=10
+        )
+    except Exception as e:
+        logger.error(f"Failed to forward: {e}")
 
-        # --- Handle DMs ---
-        if 'messaging' in entry:
-            for event in entry['messaging']:
-                sender_id = event.get('sender', {}).get('id')
-                message_text = event.get('message', {}).get('text')
-                
-                if message_text:
-                    logger.info(f"New DM received from {sender_id}: {message_text}")
-                    
-                    # TODO: CONNECT YOUR LOGIC HERE
-                    # This is where you would send this data to your separate agent.
-                    # Example: requests.post("YOUR_OTHER_AGENT_URL", json={...})
+    # Always return 200 to Meta so they don't ban your webhook
+    return jsonify({"status": "forwarded"}), 200
 
-        # --- Handle Comments ---
-        if 'changes' in entry:
-            for change in entry['changes']:
-                if change.get('field') == 'comments':
-                    val = change.get('value', {})
-                    comment_id = val.get('id')
-                    text = val.get('text')
-                    sender_id = val.get('from', {}).get('id')
-
-                    if text:
-                        logger.info(f"New Comment received from {sender_id}: {text}")
-                        
-                        # TODO: CONNECT YOUR LOGIC HERE
-                        # Example: requests.post("YOUR_OTHER_AGENT_URL", json={...})
-
-    return jsonify({"status": "processed"}), 200
-
-# --- 3. Action: Reply to DM (Uses Header Auth) ---
+# ==============================================================================
+# 3. ACTIONS (Reply via Header Auth)
+# ==============================================================================
 @app.route("/reply-dm", methods=["POST"])
 def reply_dm():
-    """
-    Sends a reply to an Instagram DM.
-    Reads 'X-Instagram-Token' from headers.
-    """
-    # 1. Get Token from Header (User Input)
     token = request.headers.get("X-Instagram-Token")
-    
-    # 2. Get Message Data
     data = request.json
-    recipient_id = data.get("recipient_id")
-    message = data.get("message")
+    
+    if not token: 
+        return jsonify({"error": "Missing X-Instagram-Token header"}), 401
 
-    # 3. Validation
-    if not token:
-        return jsonify({"error": "Missing Header: X-Instagram-Token"}), 401
-    if not recipient_id or not message:
-        return jsonify({"error": "Missing body fields: recipient_id or message"}), 400
-
-    # 4. Call Meta API
-    url = f"https://graph.facebook.com/v18.0/me/messages"
-    params = {"access_token": token}
+    url = f"https://graph.facebook.com/v18.0/me/messages?access_token={token}"
     payload = {
-        "recipient": {"id": recipient_id},
-        "message": {"text": message}
+        "recipient": {"id": data.get("recipient_id")},
+        "message": {"text": data.get("message")}
     }
-
+    
     try:
-        res = requests.post(url, params=params, json=payload, timeout=10)
-        res.raise_for_status() # Raise error for bad responses (4xx, 5xx)
-        return jsonify(res.json())
-    except requests.exceptions.RequestException as e:
-        logger.error(f"Meta API Error: {str(e)}")
+        resp = requests.post(url, json=payload, timeout=10)
+        return jsonify(resp.json()), resp.status_code
+    except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-# --- 4. Action: Reply to Comment (Uses Header Auth) ---
 @app.route("/reply-comment", methods=["POST"])
 def reply_comment():
-    """
-    Replies to a specific Instagram Comment.
-    Reads 'X-Instagram-Token' from headers.
-    """
     token = request.headers.get("X-Instagram-Token")
-    
     data = request.json
-    comment_id = data.get("comment_id")
-    message = data.get("message")
+    
+    if not token: 
+        return jsonify({"error": "Missing X-Instagram-Token header"}), 401
 
-    if not token:
-        return jsonify({"error": "Missing Header: X-Instagram-Token"}), 401
-    if not comment_id or not message:
-        return jsonify({"error": "Missing body fields: comment_id or message"}), 400
-
-    url = f"https://graph.facebook.com/v18.0/{comment_id}/replies"
-    params = {"access_token": token}
-    payload = {"message": message}
-
+    url = f"https://graph.facebook.com/v18.0/{data.get('comment_id')}/replies?access_token={token}"
+    payload = {"message": data.get("message")}
+    
     try:
-        res = requests.post(url, params=params, json=payload, timeout=10)
-        res.raise_for_status()
-        return jsonify(res.json())
-    except requests.exceptions.RequestException as e:
-        logger.error(f"Meta API Error: {str(e)}")
+        resp = requests.post(url, json=payload, timeout=10)
+        return jsonify(resp.json()), resp.status_code
+    except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 if __name__ == "__main__":
