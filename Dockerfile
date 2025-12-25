@@ -11,8 +11,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy the application code
 COPY . .
 
-# Expose the port (OnDemand usually expects port 5000 or 8080)
+# Expose port 5000
 EXPOSE 5000
 
-# Run the application using Gunicorn (Production Server)
+# Run the application using Gunicorn
 CMD ["gunicorn", "--bind", "0.0.0.0:5000", "app:app"]
