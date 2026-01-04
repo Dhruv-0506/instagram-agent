@@ -14,20 +14,15 @@ logger = logging.getLogger(__name__)
 @app.route("/webhook", methods=["GET"])
 def verify_webhook():
     """
-    User Input in Meta: 
-    Callback URL: https://your-app.com/webhook?my_secret=12345
-    Verify Token: 12345
+    Verifies the webhook connection with Meta.
+    User Input in Meta: https://.../webhook?my_secret=123
     """
-    # 1. Get the secret the USER embedded in the URL
-    user_secret_in_url = request.args.get('my_secret')
-    
-    # 2. Get the token META is sending
+    user_secret = request.args.get('my_secret')
     meta_token = request.args.get('hub.verify_token')
     challenge = request.args.get('hub.challenge')
 
-    # 3. Compare them.
-    if user_secret_in_url and meta_token and challenge:
-        if user_secret_in_url == meta_token:
+    if user_secret and meta_token and challenge:
+        if user_secret == meta_token:
             return challenge, 200
             
     return 'Forbidden', 403
@@ -38,16 +33,13 @@ def verify_webhook():
 @app.route("/webhook", methods=["POST"])
 def handle_webhook():
     """
-    User Input in Meta:
-    Callback URL: https://your-app.com/webhook?target_url=https://other-agent.com/api
+    Forwards incoming events blindly to the target_url defined in the Webhook URL.
     """
-    # 1. Read the destination from the URL
     target_url = request.args.get('target_url')
     
     if not target_url:
         return jsonify({"status": "error", "message": "No target_url provided"}), 200
 
-    # 2. Forward the data blindly.
     try:
         requests.post(
             target_url, 
@@ -58,24 +50,45 @@ def handle_webhook():
     except Exception as e:
         logger.error(f"Failed to forward: {e}")
 
-    # Always return 200 to Meta so they don't ban your webhook
     return jsonify({"status": "forwarded"}), 200
 
 # ==============================================================================
-# 3. ACTIONS (Reply via Header Auth)
+# 3. ACTIONS (Strict / Standardized)
 # ==============================================================================
+
 @app.route("/reply-dm", methods=["POST"])
 def reply_dm():
+    """
+    SAFE MODE DM:
+    - Triggers a DM (or Private Reply).
+    - CONTENT: Strictly reads 'X-Standard-DM-Message' header. 
+    - Ignores any dynamic text input.
+    """
+    # 1. Get Headers
     token = request.headers.get("X-Instagram-Token")
+    standard_message = request.headers.get("X-Standard-DM-Message")
+    
+    # 2. Validation
+    if not token: 
+        return jsonify({"error": "Missing Header: X-Instagram-Token"}), 401
+    if not standard_message:
+        return jsonify({"error": "Missing Header: X-Standard-DM-Message (Safe Mode Active)"}), 400
+        
     data = request.json
     
-    if not token: 
-        return jsonify({"error": "Missing X-Instagram-Token header"}), 401
+    # 3. Determine Target (User ID vs Comment ID)
+    if data.get("comment_id"):
+        recipient_payload = {"comment_id": data.get("comment_id")}
+    elif data.get("recipient_id"):
+        recipient_payload = {"id": data.get("recipient_id")}
+    else:
+        return jsonify({"error": "Must provide 'recipient_id' or 'comment_id'"}), 400
 
+    # 4. Send the STRICT message
     url = f"https://graph.facebook.com/v18.0/me/messages?access_token={token}"
     payload = {
-        "recipient": {"id": data.get("recipient_id")},
-        "message": {"text": data.get("message")}
+        "recipient": recipient_payload,
+        "message": {"text": standard_message} # Uses header variable only
     }
     
     try:
@@ -86,14 +99,24 @@ def reply_dm():
 
 @app.route("/reply-comment", methods=["POST"])
 def reply_comment():
+    """
+    SAFE MODE PUBLIC REPLY:
+    - Posts a public comment.
+    - CONTENT: Strictly reads 'X-Standard-Public-Message' header.
+    """
     token = request.headers.get("X-Instagram-Token")
+    standard_message = request.headers.get("X-Standard-Public-Message")
     data = request.json
     
     if not token: 
-        return jsonify({"error": "Missing X-Instagram-Token header"}), 401
+        return jsonify({"error": "Missing Header: X-Instagram-Token"}), 401
+    if not standard_message:
+        return jsonify({"error": "Missing Header: X-Standard-Public-Message"}), 400
+    if not data.get("comment_id"):
+        return jsonify({"error": "Missing 'comment_id'"}), 400
 
     url = f"https://graph.facebook.com/v18.0/{data.get('comment_id')}/replies?access_token={token}"
-    payload = {"message": data.get("message")}
+    payload = {"message": standard_message} # Uses header variable only
     
     try:
         resp = requests.post(url, json=payload, timeout=10)
